@@ -1,0 +1,16 @@
+# Python cache
+__pycache__/
+*.pyc
+
+# Local environments
+.venv/
+env/
+venv/
+
+# Large files / Data
+data/
+*.avi
+
+# Logs and Reports
+logs/
+reports/
