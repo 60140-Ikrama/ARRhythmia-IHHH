@@ -1,4 +1,4 @@
-# EchoNet-Dynamic Arrhythmia Detection System
+# IHHH Arrhythmia Detection System
 
 This repository implements a 9-agent clinical pipeline designed to classify cardiac rhythms solely from echocardiogram (ultrasound) videos, without requiring an electrocardiogram (ECG).
 
@@ -95,4 +95,4 @@ Review the diagnostic findings and measurements outputted by **Agent 9 (The Scri
 - Text Clinical Report: `reports/PAT_002_report.txt`
 - Structured EHR JSON: `reports/PAT_002_report.json`
 - Execution Log: `logs/pipeline.log`
-# Arrhythmia-EchoNet 
+# Arrhythmia-IHHH
