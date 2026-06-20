@@ -5,9 +5,11 @@ from agents.base_agent import BaseAgent
 try:
     import torch
     import torch.nn as nn
+    nn_Module = nn.Module
 except ImportError:
     torch = None
-    nn = object
+    nn = None
+    nn_Module = object
 
 try:
     import cv2
@@ -15,7 +17,7 @@ except ImportError:
     cv2 = None
 
 # 1. PyTorch U-Net Architecture Definition
-class UNet(nn):
+class UNet(nn_Module):
     def __init__(self, in_channels=1, out_channels=1):
         super().__init__()
         if torch is None:
