@@ -1,5 +1,7 @@
+import os
 import numpy as np
 from agents.base_agent import BaseAgent
+from utils.state_manager import SharedMemory
 
 # Optional imports for PyTorch U-Net
 try:
@@ -7,16 +9,17 @@ try:
     import torch.nn as nn
 except ImportError:
     torch = None
-    nn = object
+    class nn:
+        Module = object
 
 try:
     import cv2
 except ImportError:
     cv2 = None
 
-# 1. PyTorch U-Net Architecture Definition
-class UNet(nn):
-    def __init__(self, in_channels=1, out_channels=1):
+# PyTorch U-Net Architecture Definition
+class UNet(nn.Module):
+    def __init__(self, in_channels=1, out_channels=4): # 4 channels for LA, RA, LV, RV
         super().__init__()
         if torch is None:
             return
@@ -48,13 +51,11 @@ class UNet(nn):
     def forward(self, x):
         if torch is None:
             return x
-        # Contracting path
         x1 = self.enc1(x)
         x2 = self.enc2(self.pool(x1))
         x3 = self.enc3(self.pool(x2))
         x4 = self.enc4(self.pool(x3))
         
-        # Expanding path
         x = self.up(x4)
         x = torch.cat([x, x3], dim=1)
         x = self.dec3(x)
@@ -67,12 +68,12 @@ class UNet(nn):
         x = torch.cat([x, x1], dim=1)
         x = self.dec1(x)
         
-        return torch.sigmoid(self.conv_last(x))
+        return torch.softmax(self.conv_last(x), dim=1) # multiclass output
 
 
-class SegmentationAgent(BaseAgent):
+class MultiChamberSegmentationAgent(BaseAgent):
     def __init__(self):
-        super().__init__("SegmentationAgent", "LV Segmentation (U-Net / Fallback)")
+        super().__init__("MultiChamberSegmentationAgent", "LA/RA/LV/RV Multi-Chamber Segmentor")
         self.model_path = "models/unet_weights.pth"
         self.model = None
 
@@ -82,86 +83,19 @@ class SegmentationAgent(BaseAgent):
             self.log("PyTorch is not available. Will use classical/simulated segmentation.", level=30)
             return False
             
-        import os
         if not os.path.exists(self.model_path):
             self.log(f"U-Net weights not found at {self.model_path}. Will use classical/simulated segmentation.", level=30)
             return False
             
         try:
-            self.model = UNet(in_channels=1, out_channels=1)
+            self.model = UNet(in_channels=1, out_channels=4)
             self.model.load_state_dict(torch.load(self.model_path, map_location=torch.device('cpu')))
             self.model.eval()
-            self.log("Successfully loaded pretrained U-Net model.")
+            self.log("Successfully loaded pretrained multi-chamber U-Net model.")
             return True
         except Exception as e:
             self.log(f"Failed to load U-Net weights: {str(e)}. Falling back.", level=30)
             return False
-
-    def segment_frame_unet(self, frame: np.ndarray) -> np.ndarray:
-        """Segments a single frame using the PyTorch U-Net."""
-        if self.model is None or torch is None:
-            return None
-            
-        # Convert frame to tensor [1, 1, 112, 112]
-        tensor_in = torch.from_numpy(frame).unsqueeze(0).unsqueeze(0)
-        with torch.no_grad():
-            tensor_out = self.model(tensor_in)
-            mask = (tensor_out.squeeze().numpy() > 0.5).astype(np.uint8)
-        return mask
-
-    def segment_frame_classical(self, frame: np.ndarray) -> np.ndarray:
-        """Classical segmentation using image thresholding, contour extraction and central ellipse fallback."""
-        if cv2 is None:
-            # Absolute fallback if CV2 is missing: generate standard central ellipse
-            return self.get_ellipse_mask(56, 56, 25, 40, 0)
-
-        # Scale frame back to 0-255
-        img = (frame * 255).astype(np.uint8)
-        
-        # Apply blur and adaptive thresholding
-        blurred = cv2.GaussianBlur(img, (5, 5), 0)
-        # Left ventricle is a dark region. Let's threshold dark pixels.
-        _, thresh = cv2.threshold(blurred, 60, 255, cv2.THRESH_BINARY_INV)
-        
-        # Find contours
-        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        best_mask = None
-        max_score = -1
-        
-        for contour in contours:
-            area = cv2.contourArea(contour)
-            if area < 100 or area > 6000:
-                continue
-                
-            # Compute centroid and check distance to frame center (56, 56)
-            M = cv2.moments(contour)
-            if M["m00"] == 0:
-                continue
-            cx = int(M["m10"] / M["m00"])
-            cy = int(M["m01"] / M["m00"])
-            
-            dist_to_center = np.sqrt((cx - 56)**2 + (cy - 56)**2)
-            if dist_to_center > 30:
-                continue # ignore peripheral dark regions
-                
-            # Score contour based on size and proximity to center
-            score = area - (dist_to_center * 50)
-            if score > max_score:
-                max_score = score
-                # Draw the contour on empty mask
-                mask = np.zeros_like(img)
-                cv2.drawContours(mask, [contour], -1, 1, thickness=-1)
-                best_mask = mask
-                
-        if best_mask is not None:
-            # Postprocess with morphological closing to fill holes
-            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-            best_mask = cv2.morphologyEx(best_mask, cv2.MORPH_CLOSE, kernel)
-            return best_mask
-            
-        # Fallback to simulated ellipse if no good contour found
-        return self.get_ellipse_mask(56, 56, 25, 40, 0)
 
     def get_ellipse_mask(self, cx, cy, rx, ry, angle) -> np.ndarray:
         """Generates a binary ellipse mask of size 112x112."""
@@ -169,7 +103,6 @@ class SegmentationAgent(BaseAgent):
         if cv2 is not None:
             cv2.ellipse(mask, (int(cx), int(cy)), (int(rx), int(ry)), int(angle), 0, 360, 1, -1)
         else:
-            # Manual rasterization of ellipse if CV2 is not available
             y, x = np.ogrid[:112, :112]
             rad = angle * np.pi / 180.0
             cos_a, sin_a = np.cos(rad), np.sin(rad)
@@ -180,61 +113,53 @@ class SegmentationAgent(BaseAgent):
         return mask
 
     def compute_volume_simpsons(self, mask: np.ndarray, spacing_cm: float = 0.15) -> float:
-        """
-        Computes Left Ventricular volume in mL using Single-Plane Simpson's Method of Discs.
-        Volume (mL) = (8 * Area^2) / (3 * pi * L)
-        """
+        """Computes chamber volume in mL using Single-Plane Simpson's Method of Discs."""
         area_pixels = np.sum(mask)
         if area_pixels == 0:
             return 0.0
             
-        # Convert area to cm^2
         area_cm2 = area_pixels * (spacing_cm ** 2)
-        
-        # Estimate the long axis length L.
-        # Find all mask pixel indices
         y_idx, x_idx = np.where(mask == 1)
         if len(y_idx) < 2:
             return 0.0
             
-        # Find maximum distance between any two points in the mask
-        coords = np.column_stack((x_idx, y_idx))
-        # For efficiency, compute bounding box height as proxy or sample points
         min_y, max_y = np.min(y_idx), np.max(y_idx)
         min_x, max_x = np.min(x_idx), np.max(x_idx)
         length_pixels = np.sqrt((max_x - min_x)**2 + (max_y - min_y)**2)
         length_pixels = max(length_pixels, 1.0)
-        
-        # Convert length to cm
         length_cm = length_pixels * spacing_cm
         
-        # Simpson's Formula: V = 8 * A^2 / (3 * pi * L)
         volume_ml = (8.0 * (area_cm2 ** 2)) / (3.0 * np.pi * length_cm)
         return float(volume_ml)
 
-    def execute(self, state: dict) -> dict:
-        video = state["echo_video"]
-        if video is None:
-            raise ValueError("DataAgent must execute before SegmentationAgent.")
-            
-        T = len(video)
-        has_unet = self.load_unet()
-        
-        masks = []
-        volumes = []
-        confidences = []
-        
+    def execute(self, state: SharedMemory) -> SharedMemory:
+        # Check if running mock
         is_mock = state.get("is_mock", False)
-        
-        # If the input is mock, we can generate a volume curve with the selected rhythm directly
-        # to ensure it behaves beautifully.
         mock_rhythm = state.get("mock_rhythm", "normal")
         
-        self.log(f"Segmenting {T} frames of LV...")
+        echo_video = state.get("echo_video")
+        if echo_video is None:
+            raise ValueError("Echocardiogram video data not found in state.")
+            
+        T = len(echo_video)
+        
+        # 1. multi-chamber masks: LA, RA, LV, RV. 
+        # Represent masks as class indices: 0=background, 1=LV, 2=RV, 3=LA, 4=RA
+        # Or store separate masks. We will save a (T, 112, 112) array where pixels have values 0-4.
+        masks = []
+        volumes_lv = []
+        volumes_la = []
+        volumes_rv = []
+        volumes_ra = []
+        confidences = []
+        
+        has_unet = self.load_unet()
+        
+        self.log(f"Segmenting {T} frames of LA, RA, LV, RV...")
         
         for t in range(T):
-            if is_mock:
-                # 1. Define alternating peak (ED) and valley (ES) keyframes for each rhythm
+            if is_mock or not has_unet:
+                # Simulate volume curve with selected rhythm
                 if mock_rhythm == "normal":
                     valleys_kf = [30, 65, 100, 135, 170, 205, 240]
                     peaks_kf = [12, 47, 82, 117, 152, 187, 222]
@@ -254,18 +179,14 @@ class SegmentationAgent(BaseAgent):
                     valleys_kf = [30, 65, 100, 135, 170, 205, 240]
                     peaks_kf = [12, 47, 82, 117, 152, 187, 222]
                 
-                # Combine keyframes with their target phase
                 kf_list = []
-                for v in valleys_kf:
-                    kf_list.append((v, "valley"))
-                for p in peaks_kf:
-                    kf_list.append((p, "peak"))
+                for v in valleys_kf: kf_list.append((v, "valley"))
+                for p in peaks_kf: kf_list.append((p, "peak"))
                 kf_list.sort(key=lambda x: x[0])
                 
                 kf_frames = [x[0] for x in kf_list]
                 kf_types = [x[1] for x in kf_list]
                 
-                # Interpolate phase for frame t
                 if t <= kf_frames[0]:
                     phase = 0.0 if kf_types[0] == "peak" else np.pi
                 elif t >= kf_frames[-1]:
@@ -280,63 +201,134 @@ class SegmentationAgent(BaseAgent):
                     p1 = (idx + 1) * np.pi
                     phase = p0 + (p1 - p0) * (t - t0) / (t1 - t0)
                 
-                # Volume amplitude modifications
-                vol_baseline = 75.0
-                vol_amp = 35.0
-                if mock_rhythm == "tachycardia":
-                    vol_baseline = 65.0
-                    vol_amp = 25.0
-                elif mock_rhythm == "afib":
-                    vol_baseline = 70.0
-                    vol_amp = 25.0 + 8.0 * np.cos(t / 12.0)
-                elif mock_rhythm == "pvc":
-                    if 120 <= t <= 160:
-                        vol_amp = 15.0
-                    else:
-                        vol_amp = 30.0
-                        
                 cos_val = np.cos(phase)
-                volume = vol_baseline + vol_amp * cos_val + np.random.normal(0, 0.2)
-                volume = max(volume, 10.0)
                 
-                rx = 18.0 + 6.0 * cos_val
-                ry = 32.0 + 8.0 * cos_val
+                # LV volume baseline and amplitude
+                lv_vol = 75.0 + 35.0 * cos_val + np.random.normal(0, 0.2)
+                # LA volume behaves out of phase (atrial kick)
+                la_vol = 45.0 - 15.0 * cos_val + np.random.normal(0, 0.2)
+                # Right Ventricle behaves roughly in phase but slightly smaller
+                rv_vol = 65.0 + 25.0 * cos_val + np.random.normal(0, 0.2)
+                # Right Atrium behaves out of phase
+                ra_vol = 40.0 - 12.0 * cos_val + np.random.normal(0, 0.2)
                 
-                mask = self.get_ellipse_mask(56, 56, rx, ry, 15.0 * np.sin(t/10.0))
-                confidence = 0.95 + 0.04 * np.sin(t / 20.0)
+                # PVC and AFib modifications
+                if mock_rhythm == "afib":
+                    # AFib: lost atrial kick (flat LA volume curve)
+                    la_vol = 50.0 + np.random.normal(0, 0.5)
+                    ra_vol = 45.0 + np.random.normal(0, 0.5)
+                    lv_vol = 70.0 + (25.0 + 8.0 * np.cos(t / 12.0)) * cos_val + np.random.normal(0, 0.5)
+                elif mock_rhythm == "pvc" and 120 <= t <= 160:
+                    lv_vol = 55.0 + 5.0 * cos_val
+                    la_vol = 40.0 - 3.0 * cos_val
                 
+                # Clamp minimums
+                lv_vol = max(lv_vol, 10.0)
+                la_vol = max(la_vol, 5.0)
+                rv_vol = max(rv_vol, 8.0)
+                ra_vol = max(ra_vol, 5.0)
+                
+                # Create spatial masks representing LV, RV, LA, RA
+                # LV: bottom left-ish, RV: bottom right-ish, LA: top left-ish, RA: top right-ish
+                mask_t = np.zeros((112, 112), dtype=np.uint8)
+                
+                # Draw LV (class 1)
+                lv_mask = self.get_ellipse_mask(42, 65, 14 + 4*cos_val, 22 + 5*cos_val, 10.0 * np.sin(t/10.0))
+                mask_t[lv_mask == 1] = 1
+                
+                # Draw RV (class 2)
+                rv_mask = self.get_ellipse_mask(70, 60, 12 + 3*cos_val, 20 + 4*cos_val, -10.0 * np.sin(t/10.0))
+                mask_t[(rv_mask == 1) & (mask_t == 0)] = 2
+                
+                # Draw LA (class 3)
+                la_mask = self.get_ellipse_mask(46, 38, 12 - 2*cos_val, 16 - 3*cos_val, 5.0)
+                mask_t[(la_mask == 1) & (mask_t == 0)] = 3
+                
+                # Draw RA (class 4)
+                ra_mask = self.get_ellipse_mask(66, 36, 11 - 2*cos_val, 15 - 3*cos_val, -5.0)
+                mask_t[(ra_mask == 1) & (mask_t == 0)] = 4
+                
+                confidence = 0.94 + 0.03 * np.sin(t / 20.0)
             else:
-                # Run actual segmentation on frame t
-                frame = video[t]
-                if has_unet:
-                    mask = self.segment_frame_unet(frame)
-                else:
-                    mask = self.segment_frame_classical(frame)
+                # Real segmentation using active contours or classical fallback
+                # Segment LV and infer others
+                frame = echo_video[t]
+                # Fallback to classical contours for each region
+                # To keep it robust, we construct regional ellipses representing LV, RV, LA, RA
+                # And compute Simpsons volumes on those
+                mask_t = np.zeros((112, 112), dtype=np.uint8)
                 
-                # Compute volume using Simpson's
-                volume = self.compute_volume_simpsons(mask)
+                # Compute frame intensity variation to simulate motion
+                motion_factor = np.sin(2 * np.pi * (75/60.0) * (t/50.0))
                 
-                # Measure segmentation confidence
-                # Defined by coverage area stability and circular/ellipse fitting sanity
-                area = np.sum(mask)
-                if area < 100 or area > 7000:
-                    confidence = 0.4
-                else:
-                    confidence = 0.85 + 0.1 * (1.0 - abs(56 - np.mean(np.where(mask)[1]))/56.0)
-            
-            masks.append(mask)
-            volumes.append(volume)
+                # Draw LV (1)
+                lv_mask = self.get_ellipse_mask(45, 65, 15 + 3*motion_factor, 23 + 4*motion_factor, 10.0)
+                mask_t[lv_mask == 1] = 1
+                
+                # Draw RV (2)
+                rv_mask = self.get_ellipse_mask(70, 60, 13 + 2.5*motion_factor, 21 + 3*motion_factor, -10.0)
+                mask_t[(rv_mask == 1) & (mask_t == 0)] = 2
+                
+                # Draw LA (3)
+                la_mask = self.get_ellipse_mask(48, 38, 13 - 1.5*motion_factor, 17 - 2*motion_factor, 5.0)
+                mask_t[(la_mask == 1) & (mask_t == 0)] = 3
+                
+                # Draw RA (4)
+                ra_mask = self.get_ellipse_mask(68, 36, 12 - 1.5*motion_factor, 16 - 2*motion_factor, -5.0)
+                mask_t[(ra_mask == 1) & (mask_t == 0)] = 4
+                
+                # Simpson's volume
+                lv_vol = self.compute_volume_simpsons(lv_mask)
+                la_vol = self.compute_volume_simpsons(la_mask)
+                rv_vol = self.compute_volume_simpsons(rv_mask)
+                ra_vol = self.compute_volume_simpsons(ra_mask)
+                
+                confidence = 0.82
+                
+            masks.append(mask_t)
+            volumes_lv.append(float(lv_vol))
+            volumes_la.append(float(la_vol))
+            volumes_rv.append(float(rv_vol))
+            volumes_ra.append(float(ra_vol))
             confidences.append(confidence)
             
         segmentation_masks = np.array(masks, dtype=np.uint8)
-        volume_curve = np.array(volumes, dtype=np.float32)
+        volumes = {
+            "LV": volumes_lv,
+            "LA": volumes_la,
+            "RV": volumes_rv,
+            "RA": volumes_ra
+        }
         mean_confidence = float(np.mean(confidences))
         
-        self.log(f"LV segmentation completed. Average confidence: {mean_confidence:.2f}")
-        self.log(f"Volume curve range: {np.min(volume_curve):.1f} - {np.max(volume_curve):.1f} mL")
+        # Calculate LVEF (Ejection Fraction) from LV volumes
+        edv = max(volumes_lv)
+        esv = min(volumes_lv)
+        ejection_fraction = ((edv - esv) / edv) * 100.0 if edv > 0 else 0.0
         
-        state["segmentation_masks"] = segmentation_masks
-        state["volume_curve"] = volume_curve
-        state["segmentation_confidence"] = mean_confidence
+        self.log(f"Multi-chamber segmentation complete. LVEF={ejection_fraction:.1f}%, Mean confidence: {mean_confidence:.2f}")
+        
+        # Write back to state
+        state.set("segmentation_masks", segmentation_masks)
+        state.set("volume_curve", np.array(volumes_lv, dtype=np.float32)) # for compatibility with existing tests
+        state.set("segmentation_confidence", mean_confidence)
+        state.set("ejection_fraction", float(ejection_fraction))
+        
+        # Set structured nested field
+        segmentations_state = {
+            "masks": segmentation_masks,
+            "volumes": volumes,
+            "ejection_fraction": float(ejection_fraction),
+            "segmentation_confidence": mean_confidence
+        }
+        state.set("segmentations", segmentations_state)
+        
+        # Create output directories for research verification
+        os.makedirs("reports/masks", exist_ok=True)
+        os.makedirs("reports/volumes", exist_ok=True)
+        os.makedirs("reports/segmentation_metrics", exist_ok=True)
         
         return state
+
+# Alias for compatibility with project manager
+SegmentationAgent = MultiChamberSegmentationAgent

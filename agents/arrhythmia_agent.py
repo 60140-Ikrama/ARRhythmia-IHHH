@@ -1,15 +1,16 @@
 import os
 import numpy as np
 from agents.base_agent import BaseAgent
+from utils.state_manager import SharedMemory
 
 try:
     import xgboost as xgb
 except ImportError:
     xgb = None
 
-class ArrhythmiaDetectionAgent(BaseAgent):
+class ArrhythmiaClassificationAgent(BaseAgent):
     def __init__(self):
-        super().__init__("ArrhythmiaDetectionAgent", "Rhythm Diagnostician (XGBoost / Rules)")
+        super().__init__("ArrhythmiaClassificationAgent", "Rhythm Diagnostician")
         self.model_path = "models/xgboost_arrhythmia.json"
         self.booster = None
 
@@ -24,7 +25,6 @@ class ArrhythmiaDetectionAgent(BaseAgent):
             return False
             
         try:
-            # We load using booster or classifier
             self.booster = xgb.Booster()
             self.booster.load_model(self.model_path)
             self.log("Successfully loaded pretrained XGBoost classifier.")
@@ -35,16 +35,13 @@ class ArrhythmiaDetectionAgent(BaseAgent):
 
     def predict_with_xgboost(self, feature_vector: list) -> dict:
         """Runs inference using the loaded XGBoost booster."""
-        # Convert feature vector to DMatrix
         x = np.array(feature_vector).reshape(1, -1)
-        dtrain = xgb.DMatrix(x)
-        probs = self.booster.predict(dtrain)[0] # assumes multi:softprob output
+        dmatrix = xgb.DMatrix(x)
+        probs = self.booster.predict(dmatrix)[0] # assumes multi:softprob output
         
         classes = ["normal_sinus_rhythm", "atrial_fibrillation", "pvc", "bradycardia", "tachycardia"]
         
-        # If model outputs 2 classes or wrong shape, handle it
         if len(probs) != len(classes):
-            # fallback or map
             probs_dict = {cls: 0.0 for cls in classes}
             probs_dict["normal_sinus_rhythm"] = 1.0
             return probs_dict
@@ -52,10 +49,7 @@ class ArrhythmiaDetectionAgent(BaseAgent):
         return {classes[i]: float(probs[i]) for i in range(len(classes))}
 
     def predict_with_rules(self, raw_features: dict) -> dict:
-        """
-        Expert clinical decision rules fallback when XGBoost is not available.
-        Implements hierarchical diagnostic pathways.
-        """
+        """Expert clinical decision rules fallback when XGBoost is not available."""
         hr = raw_features.get("heart_rate_bpm", 75.0)
         irreg = raw_features.get("irregularity_index", 0.04)
         sdnn = raw_features.get("sdnn_ms", 45.0)
@@ -63,8 +57,6 @@ class ArrhythmiaDetectionAgent(BaseAgent):
         mot_irreg = raw_features.get("motion_irregularity", 0.15)
         rmssd = raw_features.get("rmssd_ms", 30.0)
         
-        # Level 1: Normal vs Abnormal
-        # Normal NSR is regular (irreg < 0.08) and normal HR (60-100)
         is_normal = (60.0 <= hr <= 100.0) and (irreg < 0.08) and (mot_irreg < 0.25)
         
         probs = {
@@ -83,8 +75,6 @@ class ArrhythmiaDetectionAgent(BaseAgent):
             probs["tachycardia"] = 0.01
             return probs
             
-        # Level 2: Rate-based vs Rhythm-based
-        # If highly regular rhythm (irreg < 0.08) but extreme HR, it is rate-based
         if irreg < 0.08:
             if hr < 60.0:
                 probs["bradycardia"] = 0.92
@@ -99,14 +89,11 @@ class ArrhythmiaDetectionAgent(BaseAgent):
                 probs["pvc"] = 0.01
                 probs["bradycardia"] = 0.01
             else:
-                # Borderline
                 probs["normal_sinus_rhythm"] = 0.60
                 probs["pvc"] = 0.25
                 probs["atrial_fibrillation"] = 0.15
             return probs
             
-        # Level 3: Arrhythmic - AFib vs PVC
-        # AFib is highly irregular and chaotic in both HRV and wall motion
         if irreg >= 0.15 or (sdnn > 80.0 and sd_ratio < 0.5):
             probs["atrial_fibrillation"] = 0.88
             probs["pvc"] = 0.08
@@ -114,7 +101,6 @@ class ArrhythmiaDetectionAgent(BaseAgent):
             probs["bradycardia"] = 0.01
             probs["tachycardia"] = 0.01
         else:
-            # PVC typically causes isolated skips/compensatory pauses (moderate irregularity, rmssd spike)
             probs["pvc"] = 0.85
             probs["atrial_fibrillation"] = 0.10
             probs["normal_sinus_rhythm"] = 0.03
@@ -157,24 +143,22 @@ class ArrhythmiaDetectionAgent(BaseAgent):
             
         return evidence
 
-    def execute(self, state: dict) -> dict:
-        feature_vector = state["feature_vector"]
-        feature_names = state["feature_names"]
-        
+    def execute(self, state: SharedMemory) -> SharedMemory:
+        feature_vector = state.get("fused_feature_vector")
+        if not feature_vector:
+            feature_vector = state.get("feature_vector")
+            
         if feature_vector is None:
-            raise ValueError("FeatureEngineeringAgent must execute before ArrhythmiaDetectionAgent.")
+            raise ValueError("Feature Engineering Agent must execute before Arrhythmia Classification Agent.")
             
         # Reconstruct raw features for rule validation / evidence
-        # Extract variables from state
-        hrv_time = state.get("hrv_time", {})
-        hrv_nonlinear = state.get("hrv_nonlinear", {})
-        
+        mrvm = state.get("mrvm_features", {})
         raw_features = {
-            "heart_rate_bpm": state.get("heart_rate_bpm", 75.0),
-            "irregularity_index": state.get("irregularity_index", 0.04),
-            "sdnn_ms": hrv_time.get("sdnn_ms", 45.0),
-            "rmssd_ms": hrv_time.get("rmssd_ms", 30.0),
-            "sd_ratio": hrv_nonlinear.get("sd_ratio", 0.6),
+            "heart_rate_bpm": mrvm.get("heart_rate_bpm", state.get("heart_rate_bpm", 75.0)),
+            "irregularity_index": mrvm.get("irregularity_index", state.get("irregularity_index", 0.04)),
+            "sdnn_ms": mrvm.get("sdnn_ms", 45.0),
+            "rmssd_ms": mrvm.get("rmssd_ms", 30.0),
+            "sd_ratio": mrvm.get("sd_ratio", 0.6),
             "motion_irregularity": state.get("motion_irregularity", 0.15),
             "dyssynchrony_index_ms": state.get("dyssynchrony_index_ms", 50.0)
         }
@@ -186,35 +170,36 @@ class ArrhythmiaDetectionAgent(BaseAgent):
         else:
             probabilities = self.predict_with_rules(raw_features)
             
-        # Classify based on highest probability
         rhythm = max(probabilities, key=probabilities.get)
         confidence = probabilities[rhythm]
         
-        # Determine if human review is needed
-        requires_review = confidence < 0.70
+        # Save back to state
+        state.set("rhythm", rhythm)
+        state.set("confidence", float(confidence))
+        state.set("probabilities", probabilities)
+        state.set("evidence", self.get_evidence(rhythm, raw_features))
         
-        # Generate diagnostic evidence
-        evidence = self.get_evidence(rhythm, raw_features)
+        # Save nested structure
+        predictions_state = {
+            "rhythm": rhythm,
+            "confidence": float(confidence),
+            "probabilities": probabilities
+        }
+        state.set("predictions", predictions_state)
         
-        # Log results
-        self.log(f"Diagnosis: {rhythm.upper()} with {confidence*100:.1f}% confidence.")
-        if requires_review:
-            self.log("Prediction confidence below 70%. Flagged for Clinical Review.", level=30)
-            
-        state["rhythm"] = rhythm
-        state["confidence"] = float(confidence)
-        state["probabilities"] = probabilities
-        state["evidence"] = evidence
-        state["requires_review"] = requires_review
-        
-        # Decision pathway representation
+        # Decision path
         if rhythm == "normal_sinus_rhythm":
-            state["decision_path"] = "Normal Heart Rate & Rhythm -> NSR"
+            decision_path = "Normal Heart Rate & Rhythm -> NSR"
         elif rhythm in ["bradycardia", "tachycardia"]:
-            state["decision_path"] = "Abnormal Rate -> Regular -> " + rhythm.capitalize()
+            decision_path = "Abnormal Rate -> Regular -> " + rhythm.capitalize()
         elif rhythm == "atrial_fibrillation":
-            state["decision_path"] = "Abnormal Rhythm -> High Irregularity -> AFib"
+            decision_path = "Abnormal Rhythm -> High Irregularity -> AFib"
         else:
-            state["decision_path"] = "Abnormal Rhythm -> Ectopic Skips -> PVC"
-            
+            decision_path = "Abnormal Rhythm -> Ectopic Skips -> PVC"
+        state.set("decision_path", decision_path)
+        
+        self.log(f"Arrhythmia Diagnosis complete: {rhythm.upper()} (confidence={confidence*100:.1f}%)")
         return state
+
+# Alias for compatibility with project manager
+ArrhythmiaDetectionAgent = ArrhythmiaClassificationAgent

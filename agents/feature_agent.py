@@ -2,6 +2,7 @@ import os
 import json
 import numpy as np
 from agents.base_agent import BaseAgent
+from utils.state_manager import SharedMemory
 
 class FeatureEngineeringAgent(BaseAgent):
     def __init__(self):
@@ -9,7 +10,6 @@ class FeatureEngineeringAgent(BaseAgent):
         self.scaler_path = "models/scaler_params.json"
         
         # Default scaling parameters (mean, std) for the 15 features
-        # derived from clinical reference ranges and synthetic distributions
         self.default_scaler = {
             "ejection_fraction": {"mean": 55.0, "std": 10.0},
             "heart_rate_bpm": {"mean": 75.0, "std": 20.0},
@@ -29,7 +29,7 @@ class FeatureEngineeringAgent(BaseAgent):
         }
 
     def load_scaler(self) -> dict:
-        """Loads scaler parameters from a JSON file if it exists, otherwise returns default scaling parameters."""
+        """Loads scaler parameters from a JSON file if it exists."""
         if os.path.exists(self.scaler_path):
             try:
                 with open(self.scaler_path, "r") as f:
@@ -40,44 +40,29 @@ class FeatureEngineeringAgent(BaseAgent):
                 self.log(f"Failed to load scaler file: {str(e)}. Using defaults.", level=30)
         return self.default_scaler
 
-    def save_scaler(self, scaler_params: dict):
-        """Saves scaler parameters to a JSON file."""
-        os.makedirs(os.path.dirname(self.scaler_path), exist_ok=True)
-        try:
-            with open(self.scaler_path, "w") as f:
-                json.dump(scaler_params, f, indent=4)
-            self.log(f"Saved scaler parameters to {self.scaler_path}")
-        except Exception as e:
-            self.log(f"Failed to save scaler file: {str(e)}", level=30)
-
-    def execute(self, state: dict) -> dict:
-        # 1. Collect features from upstream agents
+    def execute(self, state: SharedMemory) -> SharedMemory:
+        # Collect features from state
         ef = state.get("ejection_fraction", 0.0)
-        hr = state.get("heart_rate_bpm", 0.0)
-        irreg = state.get("irregularity_index", 0.0)
         
-        # HRV
-        hrv_time = state.get("hrv_time", {})
-        sdnn = hrv_time.get("sdnn_ms", 0.0)
-        rmssd = hrv_time.get("rmssd_ms", 0.0)
-        pnn50 = hrv_time.get("pnn50", 0.0)
+        # Check from MRVM
+        mrvm = state.get("mrvm_features", {})
+        hr = mrvm.get("heart_rate_bpm", state.get("heart_rate_bpm", 75.0))
+        irreg = mrvm.get("irregularity_index", state.get("irregularity_index", 0.04))
+        sdnn = mrvm.get("sdnn_ms", 0.0)
+        rmssd = mrvm.get("rmssd_ms", 0.0)
+        pnn50 = mrvm.get("pnn50", 0.0)
+        lf = mrvm.get("lf_power", 0.0)
+        hf = mrvm.get("hf_power", 0.0)
+        lf_hf = mrvm.get("lf_hf_ratio", 1.0)
+        sd1 = mrvm.get("sd1", 0.0)
+        sd2 = mrvm.get("sd2", 0.0)
+        sd_ratio = mrvm.get("sd_ratio", 1.0)
         
-        hrv_freq = state.get("hrv_freq", {})
-        lf = hrv_freq.get("lf_ms2", 0.0)
-        hf = hrv_freq.get("hf_ms2", 0.0)
-        lf_hf = hrv_freq.get("lf_hf", 1.0)
-        
-        hrv_nonlinear = state.get("hrv_nonlinear", {})
-        sd1 = hrv_nonlinear.get("sd1", 0.0)
-        sd2 = hrv_nonlinear.get("sd2", 0.0)
-        sd_ratio = hrv_nonlinear.get("sd_ratio", 1.0)
-        
-        # Motion
+        # Check from Motion
         dys_index = state.get("dyssynchrony_index_ms", 0.0)
         mot_irreg = state.get("motion_irregularity", 0.0)
         
-        # 2. Build feature vector (14 base features + 1 interaction feature)
-        # Interaction feature: hr * dyssynchrony
+        # Interaction feature
         hr_x_dys = hr * dys_index
         
         feature_names = [
@@ -102,24 +87,27 @@ class FeatureEngineeringAgent(BaseAgent):
             ef, hr, irreg, sdnn, rmssd, pnn50, lf, hf, lf_hf, sd1, sd2, sd_ratio, dys_index, mot_irreg, hr_x_dys
         ]
         
-        # 3. Normalize features using loaded/default scaler
+        # Scale features
         scaler = self.load_scaler()
         norm_values = []
         
         for name, val in zip(feature_names, raw_values):
-            mean = scaler[name]["mean"]
-            std = scaler[name]["std"]
-            # Prevent division by zero
+            mean = scaler.get(name, self.default_scaler[name])["mean"]
+            std = scaler.get(name, self.default_scaler[name])["std"]
             std = std if std > 0 else 1.0
             norm_val = (val - mean) / std
             norm_values.append(norm_val)
             
         feature_vector = np.array(norm_values, dtype=np.float32)
         
-        self.log(f"Fused 15 features. Raw Vector: {raw_values}")
-        self.log(f"Normalized Vector (first 5 elements): {norm_values[:5]}")
+        # Save back to state
+        state.set("feature_vector", feature_vector.tolist())
+        state.set("feature_names", feature_names)
+        state.set("fused_feature_vector", feature_vector.tolist())
         
-        state["feature_vector"] = feature_vector.tolist()
-        state["feature_names"] = feature_names
-        
+        # Log fused information
+        self.log(f"Fused {len(feature_names)} features. Normalized Vector (first 5 elements): {norm_values[:5]}")
         return state
+
+# Alias for compatibility with project manager
+FeatureEngineeringAgent = FeatureEngineeringAgent
